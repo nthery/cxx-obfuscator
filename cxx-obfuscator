@@ -1,0 +1,609 @@
+#!/usr/bin/env perl
+
+#
+# C/C++ (de-)obfuscator.  See POD at bottom of file for usage.
+#
+
+use warnings;
+use strict;
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+
+my $script_dir = dirname(__FILE__);
+my $default_pool_path = "$script_dir/cxx-obfuscator.pool.txt";
+my $default_whitelist_path = "$script_dir/cxx-obfuscator.whitelist.txt";
+
+##############################################################################
+# Character-level I/O
+##############################################################################
+
+# Next character returned by get_char() if not empty.
+my $char_cache = "";
+
+# get_char() reads this file handle.
+# Global rather than parameter because get_char() is called zillions of times.
+my $input_fh = \*STDIN;
+
+# put_string() write to this file handle or do nothing when undef.
+# Global rather than parameter because put_string() is called zillions of times.
+my $output_fh = \*STDOUT;
+
+# Cause next call to get_char() to return argument.
+sub unget_char {
+    my $char = shift @_;
+    die "cannot unget more than one character" if $char_cache;
+    $char_cache = $char;
+}
+
+# Return next character from input file handle or undef on EOF.
+sub get_char {
+    if ($char_cache) {
+        my $char = $char_cache;
+        $char_cache = "";
+        return $char;
+    }
+    if (read $input_fh, my $char, 1) {
+        return $char;
+    }
+
+    # TODO: Bail out on error.
+
+    return undef;
+}
+
+# Write argument to output file handle if defined.
+sub put_string {
+    my $s = shift @_;
+    if ($output_fh) {
+        print $output_fh $s;
+    }
+}
+
+##############################################################################
+# Scanner
+##############################################################################
+
+# Scan to end of identifier and return it.
+sub scan_id_tail {
+    my $tail = "";
+    while (defined(my $char = get_char())) { 
+        if ($char =~ /[0-9A-Za-z_]/) {
+            $tail .= $char;
+        } else {
+            unget_char($char);
+            last;
+        }
+    }
+    return $tail;
+}
+
+# Scan to end of number literal copying its characters to output file handle.
+# Note that it accepts illegal numbers, e.g. 0xXG23UL43.
+sub scan_number_tail {
+    while (defined(my $char = get_char())) { 
+        if ($char =~ /[0-9a-gA-GuUlLxX.]/) {
+            put_string($char);
+        } else {
+            unget_char($char);
+            last;
+        }
+    }
+}
+
+# Scan string or character literal up to given delimiter copying its characters to output file handle.
+# Handle backslashed identifier.
+# Note that it accepts illegal character literals (e.g. 'qwerty').
+sub scan_quoted_sequence_tail {
+    my $delim = shift @_;
+
+    while (defined(my $char = get_char())) { 
+        put_string($char);
+        if ($char eq "\\") {
+            $char = get_char();
+            put_string($char);
+        } elsif ($char eq $delim) {
+            last;
+        }
+    }
+}
+
+# "//" has been scanned.  Scan up to end of line throwing away characters.
+sub scan_cpp_comment_tail {
+    while (defined(my $char = get_char())) { 
+        if ($char eq "\n") {
+            last;
+        }
+    }
+}
+
+# "/*" has been scanned. Scan up to */ throwing away characters.
+sub scan_c_comment_tail {
+    while (defined(my $char = get_char())) { 
+        if ($char eq "*") {
+            if (defined($char = get_char())) {
+                if ($char eq "/") {
+                    last;
+                }
+            }
+        }
+    }
+}
+
+# "/" has been scanned.  Check if C or C++ comment follows and throw it away
+# should this be the case.
+sub scan_potential_comment {
+    if (defined(my $char = get_char())) {
+        if ($char eq "/") {
+            scan_cpp_comment_tail();
+        } elsif ($char eq "*") {
+            put_string(" ");
+            scan_c_comment_tail();
+        } else {
+            put_string("/");
+            unget_char($char);
+        }
+    } else {
+        put_string("/");
+    }
+}
+
+# Scan input up to next identifier copying all non-identifiers to output.
+# Return next identifier found.
+sub next_id {
+    while (defined(my $char = get_char())) {
+        if ($char =~ /[A-Za-z_]/) {
+            my $id = $char . scan_id_tail();
+            if (defined($char = get_char()) and $char =~ /["']/) {
+                # Character or string literal with encoding prefix (e.g. u8"abc").
+                put_string($id);
+                put_string($char);
+                scan_quoted_sequence_tail($char);
+            } else {
+                unget_char($char);
+                return $id;
+            }
+        } elsif ($char =~ /[0-9]/) {
+            # We special-case number literals because they may contain letters (0x, LLU...)
+            # that would otherwise be mistaken for identifiers.
+            put_string($char);
+            scan_number_tail();
+        } elsif ($char eq "\"") {
+            # We special-case string literals because they are used in some pragmas and inline assembly
+            # constructs.
+            put_string($char);
+            scan_quoted_sequence_tail("\"");
+        } elsif ($char eq "'") {
+            # We special-case character literals because we special-case string literals
+            # and character literals may contain \".
+            put_string($char);
+            scan_quoted_sequence_tail("'");
+        } elsif ($char eq "/") {
+            scan_potential_comment();
+        } else {
+            put_string($char);
+        }
+    }
+    return undef;
+}
+
+##############################################################################
+# stuff shared by conceal and reveal subcommands
+##############################################################################
+
+# Set of identifiers that are not obfuscated.
+# Initially filled with C/C++ reserved keywords and special names.
+my %whitelist = (
+    # C++ keywords
+    alignas => 1,
+    alignof => 1,
+    asm => 1,
+    auto => 1,
+    bool => 1,
+    break => 1,
+    case => 1,
+    catch => 1,
+    char => 1,
+    char16_t => 1,
+    char32_t => 1,
+    class => 1,
+    const => 1,
+    constexpr => 1,
+    const_cast => 1,
+    continue => 1,
+    decltype => 1,
+    default => 1,
+    delete => 1,
+    do => 1,
+    double => 1,
+    dynamic_cast => 1,
+    else => 1,
+    enum => 1,
+    explicit => 1,
+    export => 1,
+    extern => 1,
+    false => 1,
+    float => 1,
+    for => 1,
+    friend => 1,
+    goto => 1,
+    if => 1,
+    inline => 1,
+    int => 1,
+    long => 1,
+    mutable => 1,
+    namespace => 1,
+    new => 1,
+    noexcept => 1,
+    nullptr => 1,
+    operator => 1,
+    private => 1,
+    protected => 1,
+    public => 1,
+    register => 1,
+    reinterpret_cast => 1,
+    return => 1,
+    short => 1,
+    signed => 1,
+    sizeof => 1,
+    static => 1,
+    static_assert => 1,
+    static_cast => 1,
+    struct => 1,
+    switch => 1,
+    template => 1,
+    this => 1,
+    thread_local => 1,
+    throw => 1,
+    true => 1,
+    try => 1,
+    typedef => 1,
+    typeid => 1,
+    typename => 1,
+    union => 1,
+    unsigned => 1,
+    using => 1,
+    virtual => 1,
+    void => 1,
+    volatile => 1,
+    wchar_t => 1,
+    while => 1,
+
+    # C++ alternative representations
+    and => 1,
+    and_eq => 1,
+    bitand => 1,
+    bitor => 1,
+    compl => 1,
+    not => 1,
+    not_eq => 1,
+    or => 1,
+    or_eq => 1,
+    xor => 1,
+    xor_eq => 1,
+
+    # C++ identifiers with context-dependent meaning
+    override => 1,
+    final => 1,
+
+    #  Using typeid() require type_info to be declared.
+    type_info => 1,
+
+    # Range-for loops require begin() and end() functions.
+    begin => 1,
+    end => 1,
+
+    # main() is special
+    main => 1,
+
+    # C keywords not covered by C++ (those starting with _[A-Z] are handled in conceal_id_unless_whitelisted()).
+    restrict => 1,
+);
+
+# Map clear identifiers to obfuscated ones.
+my %concealed_ids;
+
+##############################################################################
+# conceal subcommand
+##############################################################################
+
+# Words used as prefixes for building obfuscated identifiers.
+my @prefix_pool;
+
+# Words taken from @prefix_pool are accumulated here to replenish @prefix_pool
+# when empty.
+my @next_prefix_pool;
+
+# Monotonic counter appended to prefix taken from @prefix_pool.
+# We use a perl trick ("" == 0 in numeric context) to use an empty suffix initially.
+my $prefix_generation = "";
+
+# Return new obfuscated identifier for given clear identifier or existing one
+# if previously obfuscated.
+sub conceal_id {
+    my $clear = shift @_;
+
+    if (exists($concealed_ids{$clear})) {
+        return $concealed_ids{$clear};
+    }
+
+    my $i = int(rand(scalar @prefix_pool));
+    my $concealed = $prefix_pool[$i] . $prefix_generation;
+
+    # Move selected prefix to @next_prefix_pool.
+    push @next_prefix_pool, $prefix_pool[$i];
+    if (@prefix_pool > 1) {
+        # Remove selected prefix from @prefix_pool.
+        if ($i < $#prefix_pool) {
+            # Swap with last prefix.
+            $prefix_pool[$i] = pop @prefix_pool;
+        } else {
+            pop @prefix_pool;
+        }
+    } else {
+        # Last word selected.  Replenish pool.
+        @prefix_pool = @next_prefix_pool;
+        @next_prefix_pool = ();
+        $prefix_generation++;
+    }
+
+    $concealed_ids{$clear} = $concealed;
+
+    return $concealed;
+}
+
+sub conceal_id_unless_whitelisted {
+    my $clear = shift @_;
+    if ($clear =~ /^_/ or exists($whitelist{$clear})) {
+        return $clear
+    }
+    return conceal_id($clear);
+}
+
+sub load_whitelist_words {
+    my $path = shift @_;
+
+    open my $fh, '<', $path or die "cannot open $path: $!\n";
+    while (<$fh>) {
+        chomp($_);
+        $whitelist{$_} = 1;
+    }
+    close($fh);
+}
+
+
+sub load_prefix_pool {
+    my $path = shift @_;
+
+    open my $fh, '<', $path or die "cannot open $path: $!\n";
+    while (<$fh>) {
+        chomp($_);
+        if (! $whitelist{$_}) {
+            push @prefix_pool, $_;
+        }
+    }
+    close($fh);
+}
+
+sub save_concealed_to_clear_map {
+    my $path = shift @_;
+
+    open my $fh, '>', $path or die "cannot open $path: $!\n";
+    while (my ($clear, $obfuscated) = each %concealed_ids) {
+        print $fh "$obfuscated $clear\n";
+    }
+    close($fh);
+}
+
+sub conceal_subcmd {
+    my $seed;
+    my @whitelist_paths;
+    my @pool_paths;
+    my $map_path;
+    my $help;
+    GetOptions(
+        's|seed=i' => \$seed,
+        'w|whitelist=s' => \@whitelist_paths,
+        'p|pool=s' => \@pool_paths,
+        'm|map=s' => \$map_path,
+        'h|help' => \$help,
+    ) or pod2usage(2);
+    if ($help) {
+        pod2usage(1);
+        return;
+    }
+
+    if (! $seed) {
+        $seed = time;
+    }
+    srand($seed);
+
+    print "/* cxx-obfuscator -s $seed */\n";
+
+    if (@whitelist_paths > 0) {
+        foreach my $path (@whitelist_paths) {
+            load_whitelist_words($path);
+        }
+    } elsif (-r $default_whitelist_path) {
+        load_whitelist_words($default_whitelist_path);
+    }
+
+    # Order matters: whitelist words must be loaded first.
+    if (@pool_paths > 0) {
+        foreach my $path (@pool_paths) {
+            load_prefix_pool($path);
+        }
+    } elsif (-r $default_pool_path) {
+        load_prefix_pool($default_pool_path);
+    }
+    # -p /dev/null: add single id
+    if (@prefix_pool == 0) {
+        push @prefix_pool, "id";
+    }
+
+    while (defined(my $id = next_id())) {
+        print conceal_id_unless_whitelisted($id);
+    }
+
+    if ($map_path) {
+        save_concealed_to_clear_map($map_path);
+    }
+}
+
+##############################################################################
+# reveal subcommand
+##############################################################################
+
+# Return de-obfuscated version of given identifier.
+sub reveal_id {
+    my $id = shift @_;
+
+    if (exists($concealed_ids{$id})) {
+        return $concealed_ids{$id};
+    }
+
+    # Whitelisted word.
+    return $id;
+}
+
+sub load_concealed_to_clear_map {
+    my $path = shift @_;
+
+    open my $fh, '<', $path or die "cannot open $path: $!";
+    while (<$fh>) {
+        next if /^\s*#/;
+        my ($obfuscated, $clear) = split;
+        $concealed_ids{$obfuscated} = $clear;
+    }
+    close($fh);
+}
+
+sub reveal_subcmd {
+    my $map_path;
+    my $help;
+    GetOptions(
+        'm|map=s' => \$map_path,
+        'h|help' => \$help,
+    ) or pod2usage(2);
+    if ($help) {
+        pod2usage(1);
+        return;
+    }
+    if (!$map_path) {
+        pod2usage(-exitval => 2, message => 'missing map file');
+    }
+
+    load_concealed_to_clear_map($map_path);
+
+    while (defined(my $id = next_id())) {
+        print reveal_id($id);
+    }
+}
+
+##############################################################################
+# tokenize subcommand
+##############################################################################
+
+sub tokenize_subcmd {
+    # Ignore non-identifiers.
+    $output_fh = undef;
+
+    my %tokens;
+    while (defined(my $id = next_id())) {
+        $tokens{$id} = 1;
+    }
+
+    foreach my $token (keys %tokens) {
+        print "$token\n";
+    }
+}
+
+##############################################################################
+# Entry point
+##############################################################################
+
+sub main {
+    if (@ARGV == 0) {
+        pod2usage(-message => 'missing subcommand', -exitval => 2);
+    }
+    my $subcmd = shift @ARGV;
+
+    if ($subcmd =~ /-h|-help|help/) {
+        pod2usage(-exitval => 1, -verbose => 2);
+    } elsif ($subcmd eq "conceal") {
+        conceal_subcmd();
+    } elsif ($subcmd eq "reveal") {
+        reveal_subcmd();
+    } elsif ($subcmd eq "tokenize") {
+        tokenize_subcmd();
+    } else {
+        pod2usage(-message => "bad subcommand: $subcmd",
+                  -exitval => 2);
+    }
+}
+
+main();
+
+__END__
+
+=head1 NAME
+
+    cxx-obfuscator - (de-)obfuscate C/C++ source code
+
+=head1 SYNOPSIS
+
+    cxx-obfuscator conceal [options] < clear > obfuscated
+
+    Options:
+        -map file               write obfuscated<->clear mapping to file
+        -seed num               random seed
+        -whitelist file         read words not to be obfuscated from file
+        -pool file              pool of words to pick from when obfuscating
+
+    cxx-obfuscator reveal [options] < obfuscated > clear
+
+    Options:
+        -map file       read obfuscated<->clear mapping from file
+
+    cxx-obfuscator tokenize < input > tokens
+
+=head1 DESCRIPTION
+
+B<cxx-obfuscator> is a filter that obfuscates a C/C++ source file or
+de-obfuscates a previously obfuscated file.
+The intended use case is reporting bugs to a compiler vendor without exposing confidential information.
+
+B<cxx-obfuscator> strikes a balance between protecting intellectual property and easing debugging of obfuscated code by not obfuscating standard identifiers by default.
+
+The B<conceal> subcommand obfuscates its standard input over its standard output.
+It maps identifiers (except whitelisted ones - see below) to words randomly selected from a pool.
+It removes comments.
+It leaves other tokens unchanged.
+
+The whitelist contains identifiers that must not be obfuscated.
+It always contains C/C++ keywords (while, for...), identifiers starting with '_' and some names with special meaning (begin(), end(), main()).
+The whitelist also contains by default all words in I<cxx-obfuscator.whiteliste.txt> if this file is found in the directory containing B<cxx-obfuscator>.
+This default whitelist contains all identfiers found in I</usr/include> on a typical unix system.
+The B<-whitelist> option specifies an alternative whitelist.
+
+By default obfuscated identifiers are taken from a pool of words stored in I<cxx-obfuscator.pool.txt> in the same directory as B<cxx-obfuscator>.
+The B<-pool> option specifies an alternative word pool.
+
+The B<-map> option specifies a file where the B<conceal> subcommand writes the mapping between clear and obfuscated identifiers.
+
+The B<reveal> subcommand de-obfuscates its standard input over its standard output using the map file generated by the B<conceal> subcommand.
+
+The B<tokenize> subcommand extracts tokens from its standard input.
+It is used both for generating pool and whitelist files.
+
+To generate a whitelist file containing all tokens in files in I</usr/include>:
+
+    find /usr/include -type f -print | xargs cat | cxx-obfuscator tokenize > whitelist.txt
+
+To generate a pool containing all words from Sherlock Holme's canon:
+
+    curl https://sherlock-holm.es/stories/plain-text/cano.txt | cxx-obfuscator tokenize > pool.txt
+
+
+
+=cut
