@@ -129,10 +129,10 @@ sub scan_cpp_comment_tail {
 # "/*" has been scanned. Scan up to */ throwing away characters.
 sub scan_c_comment_tail {
     while (defined(my $char = get_char())) { 
-        if ($char eq "*") {
+        while ($char eq "*") {
             if (defined($char = get_char())) {
                 if ($char eq "/") {
-                    last;
+                    return;
                 }
             }
         }
