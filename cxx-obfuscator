@@ -111,7 +111,16 @@ sub scan_quoted_sequence_tail {
 # "//" has been scanned.  Scan up to end of line throwing away characters.
 sub scan_cpp_comment_tail {
     while (defined(my $char = get_char())) { 
-        if ($char eq "\n") {
+        if ($char eq "\\") {
+            # Carry on gobbling up comment if trailing '\\'.
+            if (defined(my $char = get_char())) {
+                if ($char eq "\n") {
+                    put_string($char);
+                } else {
+                    unget_char($char);
+                }
+            }
+        } elsif ($char eq "\n") {
             last;
         }
     }
